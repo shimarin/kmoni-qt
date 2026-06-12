@@ -2,12 +2,7 @@
 """強震モニタ Qt6 WebEngine ビューア"""
 
 import os
-import socket
 import sys
-import threading
-import time
-from http.server import BaseHTTPRequestHandler, HTTPServer
-from socketserver import ThreadingMixIn
 
 # QApplication 生成前にChromiumフラグを設定（オーディオ自動再生を許可）
 os.environ.setdefault(
@@ -15,16 +10,18 @@ os.environ.setdefault(
     "--autoplay-policy=no-user-gesture-required",
 )
 
-import requests
 from PyQt6.QtCore import QUrl
-from PyQt6.QtWebEngineCore import QWebEngineSettings
+from PyQt6.QtWebEngineCore import QWebEngineScript, QWebEngineSettings
 from PyQt6.QtWebEngineWidgets import QWebEngineView
 from PyQt6.QtWidgets import QApplication, QMainWindow
 
-TARGET = "http://www.kmoni.bosai.go.jp"
-SESSION = requests.Session()
+TARGET = "http://www.kmoni.bosai.go.jp/"
 
-INJECT_STYLE = b"""<style>
+INJECT_JS_HIDE = "document.documentElement.style.visibility = 'hidden';"
+
+INJECT_JS_STYLE = """(function() {
+    var s = document.createElement('style');
+    s.textContent = `
 #loading, #header,
 #main-layerctrl, #main-infolink-ctrl,
 #main-smallmessage, #main-message,
@@ -40,86 +37,14 @@ div#main-map img:not(#map-scale) {
     left: 305px !important;
 }
 ::-webkit-scrollbar { display: none; }
-</style>"""
-
-
-def patch_html(content: bytes) -> bytes:
-    tag = b"</head>"
-    pos = content.lower().find(tag)
-    if pos != -1:
-        return content[:pos] + INJECT_STYLE + content[pos:]
-    return content + INJECT_STYLE
-
-
-class ProxyHandler(BaseHTTPRequestHandler):
-    def do_request(self):
-        target_url = TARGET + self.path
-        headers = {k: v for k, v in self.headers.items()
-                   if k.lower() not in ("host", "connection")}
-        headers["Host"] = "www.kmoni.bosai.go.jp"
-
-        content_length = int(self.headers.get("Content-Length", 0))
-        body = self.rfile.read(content_length) if content_length > 0 else None
-
-        last_exc = None
-        for attempt in range(3):
-            try:
-                resp = SESSION.request(
-                    method=self.command,
-                    url=target_url,
-                    headers=headers,
-                    data=body,
-                    allow_redirects=False,
-                    stream=True,
-                    timeout=30,
-                )
-                body_bytes = resp.content
-                content_type = resp.headers.get("Content-Type", "")
-                if "text/html" in content_type:
-                    body_bytes = patch_html(body_bytes)
-
-                self.send_response(resp.status_code)
-                for key, value in resp.headers.items():
-                    if key.lower() not in ("transfer-encoding", "connection", "content-length"):
-                        self.send_header(key, value)
-                self.send_header("Content-Length", str(len(body_bytes)))
-                self.end_headers()
-                self.wfile.write(body_bytes)
-                return
-            except Exception as e:
-                last_exc = e
-                if attempt < 2:
-                    time.sleep(0.5 * (attempt + 1))
-        self.send_error(502, "Bad Gateway")
-
-    do_GET = do_request
-    do_POST = do_request
-    do_PUT = do_request
-    do_DELETE = do_request
-    do_HEAD = do_request
-    do_OPTIONS = do_request
-    do_PATCH = do_request
-
-    def log_message(self, fmt, *args):
-        pass  # アクセスログを抑制
-
-
-class ThreadingHTTPServer(ThreadingMixIn, HTTPServer):
-    daemon_threads = True
-
-
-def start_proxy() -> int:
-    with socket.socket() as s:
-        s.bind(("127.0.0.1", 0))
-        port = s.getsockname()[1]
-    server = ThreadingHTTPServer(("127.0.0.1", port), ProxyHandler)
-    thread = threading.Thread(target=server.serve_forever, daemon=True)
-    thread.start()
-    return port
+    `;
+    document.head.appendChild(s);
+    document.documentElement.style.visibility = '';
+})();"""
 
 
 class MainWindow(QMainWindow):
-    def __init__(self, port: int):
+    def __init__(self):
         super().__init__()
         self.setWindowTitle("強震モニタ")
 
@@ -129,18 +54,32 @@ class MainWindow(QMainWindow):
         settings.setAttribute(QWebEngineSettings.WebAttribute.PlaybackRequiresUserGesture, False)
         settings.setAttribute(QWebEngineSettings.WebAttribute.AllowRunningInsecureContent, True)
 
-        view.load(QUrl(f"http://127.0.0.1:{port}/"))
+        scripts = view.page().scripts()
+
+        hide = QWebEngineScript()
+        hide.setName("kmoni-hide")
+        hide.setInjectionPoint(QWebEngineScript.InjectionPoint.DocumentCreation)
+        hide.setWorldId(QWebEngineScript.ScriptWorldId.MainWorld)
+        hide.setSourceCode(INJECT_JS_HIDE)
+        scripts.insert(hide)
+
+        style = QWebEngineScript()
+        style.setName("kmoni-style")
+        style.setInjectionPoint(QWebEngineScript.InjectionPoint.DocumentReady)
+        style.setWorldId(QWebEngineScript.ScriptWorldId.MainWorld)
+        style.setSourceCode(INJECT_JS_STYLE)
+        scripts.insert(style)
+
+        view.load(QUrl(TARGET))
         self.setCentralWidget(view)
         self.resize(365, 415)
 
 
 def main():
-    port = start_proxy()
-
     app = QApplication(sys.argv)
     app.setApplicationName("kmoni-qt")
     app.setDesktopFileName("kmoni-qt")
-    window = MainWindow(port)
+    window = MainWindow()
     window.show()
     sys.exit(app.exec())
 
